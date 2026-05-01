@@ -1,11 +1,19 @@
 import os
 import time
+import argparse
 from random import randint, seed
-from nanovllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--engine", choices=["nanovllm", "vllm"], default="nanovllm")
+    args = parser.parse_args()
+
+    if args.engine == "nanovllm":
+        from nanovllm import LLM, SamplingParams
+    else:
+        from vllm import LLM, SamplingParams
+
     seed(0)
     num_seqs = 256
     max_input_len = 1024
@@ -16,8 +24,8 @@ def main():
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+    if args.engine == "vllm":
+        prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
