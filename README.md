@@ -10,6 +10,8 @@
 
 A lightweight vLLM implementation built from scratch.
 
+Supported model families: `Qwen2` (including `Qwen2.5`) and `Qwen3`.
+
 ## Key Features
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
