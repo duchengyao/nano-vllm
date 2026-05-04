@@ -142,6 +142,33 @@ class Qwen35LinearAttentionWrapper(nn.Module):
         return self.hf_module(hidden_states.unsqueeze(0)).squeeze(0)
 
 
+class _DeltaLayerState:
+    __slots__ = ("conv_states", "recurrent_states")
+
+    def __init__(self):
+        self.conv_states = None
+        self.recurrent_states = None
+
+
+class GatedDeltaNetCache:
+
+    def __init__(self, num_layers: int):
+        self._layers = [_DeltaLayerState() for _ in range(num_layers)]
+
+    def has_previous_state(self, layer_idx: int) -> bool:
+        return self._layers[layer_idx].conv_states is not None
+
+    def update_conv_state(self, state, layer_idx: int):
+        self._layers[layer_idx].conv_states = state.detach()
+
+    def update_recurrent_state(self, state, layer_idx: int):
+        self._layers[layer_idx].recurrent_states = state.detach()
+
+    @property
+    def layers(self):
+        return self._layers
+
+
 class Qwen35DecoderLayer(nn.Module):
 
     def __init__(
@@ -183,6 +210,7 @@ class Qwen35DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        cache: GatedDeltaNetCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
@@ -191,7 +219,12 @@ class Qwen35DecoderLayer(nn.Module):
         if hasattr(self, "self_attn"):
             hidden_states = self.self_attn(positions, hidden_states)
         else:
-            hidden_states = self.linear_attn(hidden_states.unsqueeze(0)).squeeze(0)
+            if cache is not None:
+                hidden_states = self.linear_attn(
+                    hidden_states.unsqueeze(0), cache_params=cache,
+                ).squeeze(0)
+            else:
+                hidden_states = self.linear_attn(hidden_states.unsqueeze(0)).squeeze(0)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -209,6 +242,10 @@ class Qwen35Model(nn.Module):
             Qwen35DecoderLayer(text_config, i) for i in range(text_config.num_hidden_layers)
         ])
         self.norm = Qwen35RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self._cache: GatedDeltaNetCache | None = None
+
+    def reset_cache(self):
+        self._cache = GatedDeltaNetCache(len(self.layers))
 
     def forward(
         self,
@@ -217,8 +254,8 @@ class Qwen35Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        for i, layer in enumerate(self.layers):
+            hidden_states, residual = layer(positions, hidden_states, residual, self._cache)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
