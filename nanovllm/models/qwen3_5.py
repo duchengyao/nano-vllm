@@ -11,6 +11,29 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
+class Qwen35RMSNorm(nn.Module):
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        if residual is None:
+            orig_dtype = x.dtype
+            x = x.float()
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.eps)
+            return (x * (1.0 + self.weight.float())).to(orig_dtype)
+        else:
+            orig_dtype = x.dtype
+            x = x.float().add_(residual.float())
+            residual = x.to(orig_dtype)
+            var = x.pow(2).mean(dim=-1, keepdim=True)
+            x = x * torch.rsqrt(var + self.eps)
+            return (x * (1.0 + self.weight.float())).to(orig_dtype), residual
+
+
 class Qwen35Attention(nn.Module):
 
     def __init__(
@@ -49,13 +72,14 @@ class Qwen35Attention(nn.Module):
         self.o_proj = RowParallelLinear(
             self.total_num_heads * head_dim, hidden_size, bias=attn_bias,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = Qwen35RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = Qwen35RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         rope_theta = rope_scaling.get("rope_theta", 10000000) if isinstance(rope_scaling, dict) else 10000000
+        partial_factor = rope_scaling.get("partial_rotary_factor", 1.0) if isinstance(rope_scaling, dict) else 1.0
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=int(self.head_dim * partial_factor),
             max_position=max_position,
             base=rope_theta,
         )
@@ -144,15 +168,15 @@ class Qwen35DecoderLayer(nn.Module):
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
             from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
             hf_cfg = Qwen3_5TextConfig(**text_config.to_dict())
-            self.linear_attn = Qwen35LinearAttentionWrapper(Qwen3_5GatedDeltaNet(hf_cfg, layer_idx))
+            self.linear_attn = Qwen3_5GatedDeltaNet(hf_cfg, layer_idx)
 
         self.mlp = Qwen35MLP(
             hidden_size=text_config.hidden_size,
             intermediate_size=text_config.intermediate_size,
             hidden_act=text_config.hidden_act,
         )
-        self.input_layernorm = RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self.input_layernorm = Qwen35RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen35RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
 
     def forward(
         self,
@@ -167,7 +191,7 @@ class Qwen35DecoderLayer(nn.Module):
         if hasattr(self, "self_attn"):
             hidden_states = self.self_attn(positions, hidden_states)
         else:
-            hidden_states = self.linear_attn(positions, hidden_states)
+            hidden_states = self.linear_attn(hidden_states.unsqueeze(0)).squeeze(0)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -184,7 +208,7 @@ class Qwen35Model(nn.Module):
         self.layers = nn.ModuleList([
             Qwen35DecoderLayer(text_config, i) for i in range(text_config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self.norm = Qwen35RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
 
     def forward(
         self,
