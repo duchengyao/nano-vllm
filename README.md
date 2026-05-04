@@ -47,7 +47,7 @@ outputs[0]["text"]
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `benchmarks/` for benchmarks and `benchmarks/BENCH_RESULTS.md` for detailed results.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
