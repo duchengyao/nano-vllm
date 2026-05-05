@@ -94,7 +94,7 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
+        num_seqs = 1
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len

@@ -187,6 +187,46 @@ class Qwen35HFAttentionWrapper(nn.Module):
         ctx = get_context()
         bs = hidden_states.shape[0]
 
+        if not self.nano_attn.k_cache.numel():
+            # Warmup: use HF attention for correctness, no cache storage needed
+            hf_inp = hidden_states.unsqueeze(0)
+            pos_3d = positions.unsqueeze(0)
+            rotary_dim = int(self.head_dim * 0.25)
+            inv_freq = 1.0 / (10000000 ** (torch.arange(0, rotary_dim, 2, device=hidden_states.device, dtype=torch.float) / rotary_dim))
+            t = pos_3d.float()
+            freqs = torch.einsum('bi,j->bij', t.squeeze(-1) if t.dim() > 2 else t, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            pos_emb = (emb.cos().to(hidden_states.dtype), emb.sin().to(hidden_states.dtype))
+            attn_out, _ = self.hf_attn(hf_inp, position_embeddings=pos_emb, attention_mask=None)
+            return attn_out.squeeze(0)
+
+        if ctx.is_prefill:
+            # Prefill: use HF attention for correctness
+            hf_inp = hidden_states.unsqueeze(0)
+            pos_3d = positions.unsqueeze(0)
+            rotary_dim = int(self.head_dim * 0.25)
+            inv_freq = 1.0 / (10000000 ** (torch.arange(0, rotary_dim, 2, device=hidden_states.device, dtype=torch.float) / rotary_dim))
+            t = pos_3d.float()
+            freqs = torch.einsum('bi,j->bij', t.squeeze(-1) if t.dim() > 2 else t, inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            pos_emb = (emb.cos().to(hidden_states.dtype), emb.sin().to(hidden_states.dtype))
+            attn_out, _ = self.hf_attn(hf_inp, position_embeddings=pos_emb, attention_mask=None)
+            # Also compute K,V for nano cache
+            k = self.hf_attn.k_proj(hf_inp).squeeze(0).reshape(bs, self.num_kv_heads, self.head_dim)
+            v = self.hf_attn.v_proj(hf_inp).squeeze(0).reshape(bs, self.num_kv_heads, self.head_dim)
+            k = self.hf_attn.k_norm(k)
+            cos_sin = self.rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if self.rotary_emb.rotary_dim < self.head_dim:
+                from nanovllm.layers.rotary_embedding import apply_rotary_emb
+                k_rot = apply_rotary_emb(k[..., :self.rotary_emb.rotary_dim], cos, sin)
+                k = torch.cat([k_rot, k[..., self.rotary_emb.rotary_dim:]], dim=-1)
+            if ctx.slot_mapping is not None and ctx.slot_mapping.numel() > 0:
+                from nanovllm.layers.attention import store_kvcache
+                store_kvcache(k, v, self.nano_attn.k_cache, self.nano_attn.v_cache, ctx.slot_mapping)
+                self._cache_populated = True
+            return attn_out.squeeze(0)
+
         if ctx.is_prefill:
             # Compute Q,K,V using HF projections, store K,V in nano cache
             hf_inp = hidden_states.unsqueeze(0)
@@ -205,7 +245,10 @@ class Qwen35HFAttentionWrapper(nn.Module):
             o = self.nano_attn(q, k, v)
             o = o.reshape(bs, -1) * torch.sigmoid(gate)
             o = self.hf_attn.o_proj(o)
-            self._cache_populated = True
+            if ctx.slot_mapping is not None and ctx.slot_mapping.numel() > 0:
+                from nanovllm.layers.attention import store_kvcache
+                store_kvcache(k, v, self.nano_attn.k_cache, self.nano_attn.v_cache, ctx.slot_mapping)
+                self._cache_populated = True
             return o
         else:
             if self._cache_populated:
@@ -214,14 +257,14 @@ class Qwen35HFAttentionWrapper(nn.Module):
                 k = self.hf_attn.k_proj(hf_inp).squeeze(0)
                 v = self.hf_attn.v_proj(hf_inp).squeeze(0)
                 q, gate = q.split([q.shape[-1] // 2, q.shape[-1] // 2], dim=-1)
-                q = q.reshape(1, -1, self.head_dim)
-                k = k.reshape(1, self.num_kv_heads, self.head_dim)
-                v = v.reshape(1, self.num_kv_heads, self.head_dim)
+                q = q.reshape(bs, -1, self.head_dim)
+                k = k.reshape(bs, self.num_kv_heads, self.head_dim)
+                v = v.reshape(bs, self.num_kv_heads, self.head_dim)
                 q = self.hf_attn.q_norm(q)
                 k = self.hf_attn.k_norm(k)
                 q, k = self.rotary_emb(positions, q, k)
                 o = self.nano_attn(q, k, v)
-                o = o.reshape(1, -1) * torch.sigmoid(gate)
+                o = o.reshape(bs, -1) * torch.sigmoid(gate)
                 o = self.hf_attn.o_proj(o)
                 return o.squeeze(0)
             else:
