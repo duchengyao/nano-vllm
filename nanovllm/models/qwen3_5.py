@@ -186,19 +186,58 @@ class Qwen35HFAttentionWrapper(nn.Module):
         from nanovllm.utils.context import get_context
         ctx = get_context()
         bs = hidden_states.shape[0]
+        hf_inp = hidden_states.unsqueeze(0)
+        pos_3d = positions.unsqueeze(0)
 
-        if not self.nano_attn.k_cache.numel():
-            # Warmup: use HF attention for correctness, no cache storage needed
-            hf_inp = hidden_states.unsqueeze(0)
-            pos_3d = positions.unsqueeze(0)
-            rotary_dim = int(self.head_dim * 0.25)
-            inv_freq = 1.0 / (10000000 ** (torch.arange(0, rotary_dim, 2, device=hidden_states.device, dtype=torch.float) / rotary_dim))
-            t = pos_3d.float()
-            freqs = torch.einsum('bi,j->bij', t.squeeze(-1) if t.dim() > 2 else t, inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            pos_emb = (emb.cos().to(hidden_states.dtype), emb.sin().to(hidden_states.dtype))
+        # Compute position embeddings (same as HF's Qwen3_5TextRotaryEmbedding)
+        rotary_dim = int(self.head_dim * 0.25)
+        inv_freq = 1.0 / (10000000 ** (torch.arange(0, rotary_dim, 2, device=hidden_states.device, dtype=torch.float) / rotary_dim))
+        t = pos_3d.float()
+        freqs = torch.einsum('bi,j->bij', t.squeeze(-1) if t.dim() > 2 else t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        pos_emb = (emb.cos().to(hidden_states.dtype), emb.sin().to(hidden_states.dtype))
+
+        if not self.nano_attn.k_cache.numel() or ctx.is_prefill:
+            # Warmup or prefill: use HF attention for correctness
             attn_out, _ = self.hf_attn(hf_inp, position_embeddings=pos_emb, attention_mask=None)
+            # Store K,V in nano cache for decode (using exact HF formulas)
+            if ctx.slot_mapping is not None and ctx.slot_mapping.numel() > 0:
+                k = self.hf_attn.k_proj(hf_inp).view(1, bs, self.num_kv_heads, self.head_dim)
+                k = self.hf_attn.k_norm(k).transpose(1, 2)
+                v = self.hf_attn.v_proj(hf_inp).view(1, bs, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                cos_in = pos_emb[0].unsqueeze(1)
+                sin_in = pos_emb[1].unsqueeze(1)
+                from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+                dummy = torch.zeros_like(k)
+                _, k = apply_rotary_pos_emb(dummy, k, cos_in, sin_in)
+                k = k.transpose(1, 2).reshape(bs, self.num_kv_heads, self.head_dim)
+                v = v.transpose(1, 2).reshape(bs, self.num_kv_heads, self.head_dim)
+                from nanovllm.layers.attention import store_kvcache
+                store_kvcache(k, v, self.nano_attn.k_cache, self.nano_attn.v_cache, ctx.slot_mapping)
+                self._cache_populated = True
             return attn_out.squeeze(0)
+        else:
+            if self._cache_populated:
+                q = self.hf_attn.q_proj(hf_inp).view(1, bs, -1, self.head_dim * 2)
+                q, gate = q.chunk(2, dim=-1)
+                q = self.hf_attn.q_norm(q).transpose(1, 2)
+                k = self.hf_attn.k_proj(hf_inp).view(1, bs, self.num_kv_heads, self.head_dim)
+                k = self.hf_attn.k_norm(k).transpose(1, 2)
+                v = self.hf_attn.v_proj(hf_inp).view(1, bs, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                cos_in = pos_emb[0].unsqueeze(1)
+                sin_in = pos_emb[1].unsqueeze(1)
+                from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+                q, k = apply_rotary_pos_emb(q, k, cos_in, sin_in)
+                q = q.transpose(1, 2).reshape(bs, -1, self.head_dim)
+                k = k.transpose(1, 2).reshape(bs, self.num_kv_heads, self.head_dim)
+                v = v.transpose(1, 2).reshape(bs, self.num_kv_heads, self.head_dim)
+                o = self.nano_attn(q, k, v)
+                o = o.reshape(bs, -1) * torch.sigmoid(gate.transpose(1, 2).reshape(bs, -1))
+                o = self.hf_attn.o_proj(o)
+                return o
+            else:
+                attn_out, _ = self.hf_attn(hf_inp, position_embeddings=pos_emb, attention_mask=None)
+                return attn_out.squeeze(0)
 
         if ctx.is_prefill:
             # Prefill: use HF attention for correctness
