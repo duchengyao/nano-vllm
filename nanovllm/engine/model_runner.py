@@ -14,8 +14,6 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    _graph_captured = False
-
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
@@ -36,6 +34,8 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        if not self.enforce_eager:
+            self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -213,10 +213,7 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            try:
-                graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            except (StopIteration, KeyError):
-                return self.model.compute_logits(self.model(input_ids, positions))
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -240,61 +237,21 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
-        
-        # After first prefill, try capturing CUDA graph with real GDN state
-        if is_prefill and not self._graph_captured and not self.enforce_eager:
-            saved = self._save_gdn_state()
-            try:
-                self.capture_cudagraph()
-                self._graph_captured = True
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self._graph_captured = False
-            self._restore_gdn_state(saved)
-        
         return token_ids
-
-    def _save_gdn_state(self):
-        saved = []
-        m = self.model
-        if hasattr(m, "model") and hasattr(m.model, "language_model"):
-            cache = getattr(m.model.language_model, "_cache", None)
-            if cache is not None:
-                for i, ls in enumerate(cache._layers):
-                    saved.append((
-                        i,
-                        ls.conv_states.detach().clone() if ls.conv_states is not None else None,
-                        ls.recurrent_states.detach().clone() if ls.recurrent_states is not None else None,
-                    ))
-        return saved
-
-    def _restore_gdn_state(self, saved):
-        m = self.model
-        if hasattr(m, "model") and hasattr(m.model, "language_model"):
-            cache = getattr(m.model.language_model, "_cache", None)
-            if cache is not None and saved:
-                for i, conv, rec in saved:
-                    if conv is not None:
-                        cache._layers[i].conv_states = conv
-                    if rec is not None:
-                        cache._layers[i].recurrent_states = rec
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        prev_device = torch.get_default_device()
-        torch.set_default_device('cuda')
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64, device='cuda')
-        positions = torch.zeros(max_bs, dtype=torch.int64, device='cuda')
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32, device='cuda')
-        context_lens = torch.zeros(max_bs, dtype=torch.int32, device='cuda')
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device='cuda')
-        outputs = torch.zeros(max_bs, hf_config.hidden_size, device='cuda')
-        self.graph_bs = [1]  # Minimal for GDN models
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
@@ -318,4 +275,3 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
-        torch.set_default_device(prev_device)
