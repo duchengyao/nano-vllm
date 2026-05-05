@@ -14,6 +14,8 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
+    _graph_captured = False
+
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
@@ -237,7 +239,40 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
+
+        # If this model uses GDNStateCache, recapture graph after prefill with real state
+        if is_prefill and not self._graph_captured and not self.enforce_eager:
+            saved = self._save_gdn_state()
+            old_device = torch.get_default_device()
+            torch.set_default_device('cuda')
+            torch.set_default_dtype(self.config.hf_config.dtype)
+            try:
+                self.capture_cudagraph()
+                self._graph_captured = True
+            except Exception:
+                self._graph_captured = False
+            torch.set_default_device(old_device)
+            self._restore_gdn_state(saved)
+
         return token_ids
+
+    def _save_gdn_state(self):
+        m = self.model
+        if hasattr(m, "model") and hasattr(m.model, "language_model"):
+            cache = getattr(m.model.language_model, "_state_cache", None)
+            if cache is not None:
+                return cache._conv.clone(), cache._rec.clone()
+        return None
+
+    def _restore_gdn_state(self, saved):
+        if saved is None:
+            return
+        m = self.model
+        if hasattr(m, "model") and hasattr(m.model, "language_model"):
+            cache = getattr(m.model.language_model, "_state_cache", None)
+            if cache is not None:
+                cache._conv.copy_(saved[0])
+                cache._rec.copy_(saved[1])
 
     @torch.inference_mode()
     def capture_cudagraph(self):
