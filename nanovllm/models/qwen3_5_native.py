@@ -71,18 +71,17 @@ class Qwen35Attention(nn.Module):
 
     def forward(self, positions, hidden_states):
         bs = hidden_states.shape[0]
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        q, gate = q.split([self.num_heads * self.head_dim, self.num_heads * self.head_dim], dim=-1)
-        q = q.view(bs, self.num_heads, self.head_dim)
-        k = k.view(bs, self.num_kv_heads, self.head_dim)
-        v = v.view(bs, self.num_kv_heads, self.head_dim)
+        q = self.q_proj(hidden_states).view(bs, self.num_heads, -1)
+        k = self.k_proj(hidden_states).view(bs, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(bs, self.num_kv_heads, self.head_dim)
+        q, gate = q.chunk(2, dim=-1)  # (bs, nh, hd) each
+        q = q.contiguous()
+        gate = gate.contiguous()
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        o = o.reshape(bs, -1) * torch.sigmoid(gate)
+        o = o.reshape(bs, -1) * torch.sigmoid(gate.reshape(bs, -1))
         return self.o_proj(o)
 
 
