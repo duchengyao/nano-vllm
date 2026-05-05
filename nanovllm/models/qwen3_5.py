@@ -42,20 +42,24 @@ class Qwen35ForCausalLM(nn.Module):
             max_len = lengths.max().item()
             batch_ids = torch.zeros(num_seqs, max_len, dtype=input_ids.dtype, device=input_ids.device)
             batch_pos = torch.zeros(num_seqs, max_len, dtype=positions.dtype, device=positions.device)
+            attn_mask = torch.zeros(num_seqs, max_len, dtype=torch.bool, device=input_ids.device)
             for i in range(num_seqs):
                 start = ctx.cu_seqlens_q[i].item()
                 end = ctx.cu_seqlens_q[i+1].item()
                 seq_len = end - start
                 batch_ids[i, :seq_len] = input_ids[start:end]
                 batch_pos[i, :seq_len] = positions[start:end]
+                attn_mask[i, :seq_len] = True
+            pkv = None
         else:
-            # Decode: (num_seqs,) flat → (num_seqs, 1) batch
             batch_ids = input_ids.unsqueeze(-1)
             batch_pos = positions.unsqueeze(-1)
+            attn_mask = None
+            pkv = self._past_key_values
 
         output = self.model.language_model(
-            batch_ids, attention_mask=None, position_ids=batch_pos,
-            past_key_values=self._past_key_values, use_cache=True,
+            batch_ids, attention_mask=attn_mask, position_ids=batch_pos,
+            past_key_values=pkv, use_cache=True,
         )
         self._past_key_values = output.past_key_values
         h = output.last_hidden_state
@@ -63,7 +67,7 @@ class Qwen35ForCausalLM(nn.Module):
         if ctx.is_prefill and ctx.cu_seqlens_q is not None:
             flat_parts = []
             for i in range(num_seqs):
-                seq_len = (ctx.cu_seqlens_q[i+1] - ctx.cu_seqlens_q[i]).item()
+                seq_len = lengths[i].item()
                 flat_parts.append(h[i, :seq_len])
             h = torch.cat(flat_parts, dim=0)
         else:
