@@ -14,6 +14,8 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
+    _graph_captured = False
+
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
@@ -34,8 +36,6 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -237,7 +237,40 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
+        
+        # After first prefill, try capturing CUDA graph with real GDN state
+        if is_prefill and not self._graph_captured and not self.enforce_eager:
+            saved = self._save_gdn_state()
+            try:
+                self.capture_cudagraph()
+                self._graph_captured = True
+            except Exception:
+                pass
+            self._restore_gdn_state(saved)
+        
         return token_ids
+
+    def _save_gdn_state(self):
+        saved = []
+        m = self.model
+        if hasattr(m, "model") and hasattr(m.model, "language_model"):
+            cache = getattr(m.model.language_model, "_cache", None)
+            if cache is not None:
+                for i, ls in enumerate(cache._layers):
+                    saved.append((i, ls.conv_states.clone() if ls.conv_states is not None else None,
+                                  ls.recurrent_states.clone() if ls.recurrent_states is not None else None))
+        return saved
+
+    def _restore_gdn_state(self, saved):
+        m = self.model
+        if hasattr(m, "model") and hasattr(m.model, "language_model"):
+            cache = getattr(m.model.language_model, "_cache", None)
+            if cache is not None and saved:
+                for i, conv, rec in saved:
+                    if conv is not None:
+                        cache._layers[i].conv_states = conv
+                    if rec is not None:
+                        cache._layers[i].recurrent_states = rec
 
     @torch.inference_mode()
     def capture_cudagraph(self):
