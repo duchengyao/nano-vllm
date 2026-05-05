@@ -75,6 +75,11 @@ class Qwen35ForCausalLM(nn.Module):
         return h
 
     def compute_logits(self, hidden_states):
+        from nanovllm.utils.context import get_context
+        ctx = get_context()
+        if ctx.is_prefill and ctx.cu_seqlens_q is not None:
+            last_indices = ctx.cu_seqlens_q[1:] - 1
+            hidden_states = hidden_states[last_indices].contiguous()
         weight = self.model.language_model.embed_tokens.weight
         return F.linear(hidden_states, weight)
 
