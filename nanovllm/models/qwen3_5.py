@@ -169,6 +169,72 @@ class GatedDeltaNetCache:
         return self._layers
 
 
+class Qwen35HFAttentionWrapper(nn.Module):
+
+    def __init__(self, hf_attn, num_kv_heads, head_dim, max_position, rope_theta, partial_factor):
+        super().__init__()
+        self.hf_attn = hf_attn
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        from nanovllm.layers.attention import Attention
+        from nanovllm.layers.rotary_embedding import get_rope
+        self.nano_attn = Attention(head_dim, head_dim, 1.0, num_kv_heads)
+        self.rotary_emb = get_rope(head_dim, int(head_dim * partial_factor), max_position, rope_theta)
+        self._cache_populated = False
+
+    def forward(self, positions, hidden_states):
+        from nanovllm.utils.context import get_context
+        ctx = get_context()
+        bs = hidden_states.shape[0]
+
+        if ctx.is_prefill:
+            # Compute Q,K,V using HF projections, store K,V in nano cache
+            hf_inp = hidden_states.unsqueeze(0)
+            k_out = self.hf_attn.k_proj(hf_inp).squeeze(0)
+            k = k_out.reshape(bs, self.num_kv_heads, self.head_dim)
+            v_out = self.hf_attn.v_proj(hf_inp).squeeze(0)
+            v = v_out.reshape(bs, self.num_kv_heads, self.head_dim)
+            q_out = self.hf_attn.q_proj(hf_inp).squeeze(0)
+            half = q_out.shape[-1] // 2
+            q, gate = q_out.split([half, half], dim=-1)
+            q = q.reshape(bs, -1, self.head_dim)
+            k = self.hf_attn.k_norm(k)
+            q = self.hf_attn.q_norm(q)
+            q, k = self.rotary_emb(positions, q, k)
+            # Use nano attn for prefill (flash_attn_varlen_func)
+            o = self.nano_attn(q, k, v)
+            o = o.reshape(bs, -1) * torch.sigmoid(gate)
+            o = self.hf_attn.o_proj(o)
+            self._cache_populated = True
+            return o
+        else:
+            if self._cache_populated:
+                hf_inp = hidden_states.unsqueeze(0)
+                q = self.hf_attn.q_proj(hf_inp).squeeze(0)
+                k = self.hf_attn.k_proj(hf_inp).squeeze(0)
+                v = self.hf_attn.v_proj(hf_inp).squeeze(0)
+                q, gate = q.split([q.shape[-1] // 2, q.shape[-1] // 2], dim=-1)
+                q = q.reshape(1, -1, self.head_dim)
+                k = k.reshape(1, self.num_kv_heads, self.head_dim)
+                v = v.reshape(1, self.num_kv_heads, self.head_dim)
+                q = self.hf_attn.q_norm(q)
+                k = self.hf_attn.k_norm(k)
+                q, k = self.rotary_emb(positions, q, k)
+                o = self.nano_attn(q, k, v)
+                o = o.reshape(1, -1) * torch.sigmoid(gate)
+                o = self.hf_attn.o_proj(o)
+                return o.squeeze(0)
+            else:
+                hf_inp = hidden_states.unsqueeze(0)
+                pos_3d = positions.unsqueeze(0)
+                # Fallback HF forward
+                attn_out, _ = self.hf_attn(hf_inp, position_embeddings=(
+                    torch.zeros(1, int(self.head_dim * 0.25), device=hidden_states.device),
+                    torch.zeros(1, int(self.head_dim * 0.25), device=hidden_states.device),
+                ), attention_mask=None)
+                return attn_out.squeeze(0)
+
+
 class Qwen35DecoderLayer(nn.Module):
 
     def __init__(
@@ -181,15 +247,17 @@ class Qwen35DecoderLayer(nn.Module):
         is_full_attention = layer_idx % text_config.full_attention_interval == text_config.full_attention_interval - 1
 
         if is_full_attention:
-            self.self_attn = Qwen35Attention(
-                hidden_size=text_config.hidden_size,
-                num_heads=text_config.num_attention_heads,
-                num_kv_heads=text_config.num_key_value_heads,
-                head_dim=text_config.head_dim,
-                max_position=text_config.max_position_embeddings,
-                rms_norm_eps=text_config.rms_norm_eps,
-                attn_bias=getattr(text_config, "attention_bias", False),
-                rope_scaling=getattr(text_config, "rope_parameters", None),
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention as HFAttn
+            from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+            hf_cfg = Qwen3_5TextConfig(**text_config.to_dict())
+            hf_cfg._attn_implementation = "flash_attention_2"
+            hf_attn = HFAttn(hf_cfg, layer_idx)
+            rope_cfg = getattr(text_config, "rope_parameters", {})
+            self.self_attn = Qwen35HFAttentionWrapper(
+                hf_attn, text_config.num_key_value_heads, text_config.head_dim,
+                text_config.max_position_embeddings,
+                rope_cfg.get("rope_theta", 10000000) if isinstance(rope_cfg, dict) else 10000000,
+                rope_cfg.get("partial_rotary_factor", 1.0) if isinstance(rope_cfg, dict) else 1.0,
             )
         else:
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
